@@ -4,17 +4,22 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-static const char *TAG = "I2C_LESSON";
+#include "ds1307.h"
+#include "ssd1306.h"
 
-// Налаштування пінів (для ESP32-S3 можна обирати майже будь-які вільні GPIO)
-#define I2C_MASTER_SCL_IO           9      
-#define I2C_MASTER_SDA_IO           8      
-#define I2C_MASTER_NUM              0      // Номер порту I2C
-#define I2C_MASTER_FREQ_HZ          100000 // Стандартна частота 100 кГц
-#define RTC_ADDR                    0x68   // I2C адреса DS1307
+static const char *TAG = "MAIN";
 
-// Функція для ініціалізації шини I2C
-esp_err_t i2c_master_init(void) {
+// Налаштування шини I2C (для ESP32-S3 можна обирати майже будь-які вільні GPIO)
+#define I2C_MASTER_SCL_IO   9
+#define I2C_MASTER_SDA_IO   8
+#define I2C_MASTER_NUM      0      // Номер порту I2C
+#define I2C_MASTER_FREQ_HZ  100000 // Стандартна частота 100 кГц
+
+// Абревіатури днів тижня. Індекс = значення регістра DS1307 (домовляємось: 1=Sun ... 7=Sat)
+static const char *WEEKDAYS[] = {"---", "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+
+// Ініціалізація шини I2C (Master)
+static esp_err_t i2c_master_init(void) {
     i2c_config_t conf = {
         .mode = I2C_MODE_MASTER,
         .sda_io_num = I2C_MASTER_SDA_IO,
@@ -29,49 +34,30 @@ esp_err_t i2c_master_init(void) {
     return i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
 }
 
-// Функція конвертації з BCD формату у звичайний десятковий
-uint8_t bcd_to_dec(uint8_t val) {
-    return (val >> 4) * 10 + (val & 0x0F);
-}
+// Скомпонувати і вивести час та дату на дисплей
+static void display_clock(const rtc_time_t *t) {
+    char time_str[16];
+    char date_str[24];
 
-// Функція для зчитування часу і дати з RTC
-void read_rtc_datetime() {
-    uint8_t data_rx[7]; // Буфер для 7 регістрів: сек, хв, год, день тижня, дата, місяць, рік
+    // Рядок часу: HH:MM:SS
+    snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d",
+             t->hours, t->minutes, t->seconds);
 
-    // 1. Створюємо "ланцюжок" команд для I2C
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    // Рядок дати: EEE DD.MM.YYYY (день тижня + дата)
+    const char *wday = (t->day_of_week >= 1 && t->day_of_week <= 7)
+                           ? WEEKDAYS[t->day_of_week] : "---";
+    snprintf(date_str, sizeof(date_str), "%s %02d.%02d.20%02d",
+             wday, t->date, t->month, t->year);
 
-    // 2. Формуємо запит на запис: вказуємо адресу пристрою і номер першого регістра (0x00)
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (RTC_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, 0x00, true); // Починаємо з регістра секунд
+    ssd1306_clear();
+    // Час великим шрифтом (scale=2): ширина 8 символів * 12px = 96, центруємо
+    ssd1306_draw_string(16, 12, time_str, 2);
+    // Дата звичайним шрифтом (scale=1): ширина 14 символів * 6px = 84, центруємо
+    ssd1306_draw_string(22, 44, date_str, 1);
+    ssd1306_update();
 
-    // 3. Робимо Restart і просимо пристрій віддати дані
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (RTC_ADDR << 1) | I2C_MASTER_READ, true);
-    // Читаємо 6 байт з ACK, а останній (рік) з NACK. DS1307 сам інкрементує вказівник регістра.
-    i2c_master_read(cmd, data_rx, 6, I2C_MASTER_ACK);
-    i2c_master_read_byte(cmd, &data_rx[6], I2C_MASTER_NACK); // Останній байт + NACK (кінець)
-    i2c_master_stop(cmd);
-
-    // 4. Виконуємо сформований ланцюжок команд
-    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 1000 / portTICK_PERIOD_MS);
-    i2c_cmd_link_delete(cmd); // Очищуємо пам'ять
-
-    if (ret == ESP_OK) {
-        // Конвертуємо BCD формат у звичайні цифри
-        uint8_t seconds = bcd_to_dec(data_rx[0] & 0x7F); // 0x7F відкидає старший біт CH (Clock Halt)
-        uint8_t minutes = bcd_to_dec(data_rx[1] & 0x7F);
-        uint8_t hours   = bcd_to_dec(data_rx[2] & 0x3F); // 0x3F: біти 0-5 (режим 24 години)
-        uint8_t date    = bcd_to_dec(data_rx[4] & 0x3F); // Число місяця (1-31)
-        uint8_t month   = bcd_to_dec(data_rx[5] & 0x1F); // Місяць (1-12)
-        uint8_t year    = bcd_to_dec(data_rx[6]);        // Рік (00-99)
-
-        ESP_LOGI(TAG, "Час: %02d:%02d:%02d   Дата: %02d.%02d.20%02d",
-                 hours, minutes, seconds, date, month, year);
-    } else {
-        ESP_LOGE(TAG, "Помилка читання I2C: %s", esp_err_to_name(ret));
-    }
+    // Дублюємо в монітор порту
+    ESP_LOGI(TAG, "%s   %s", time_str, date_str);
 }
 
 void app_main(void) {
@@ -79,8 +65,26 @@ void app_main(void) {
     ESP_ERROR_CHECK(i2c_master_init());
     ESP_LOGI(TAG, "I2C ініціалізовано успішно!");
 
+    // Ініціалізація дисплея
+    ssd1306_init();
+    ssd1306_clear();
+    ssd1306_update();
+    ESP_LOGI(TAG, "Дисплей SSD1306 ініціалізовано!");
+
+    // === ВСТАНОВЛЕННЯ ЧАСУ (виконати ОДИН РАЗ) ===
+    // Параметри: год, хв, сек, день тижня (1=Sun..7=Sat), число, місяць, рік(20XX).
+    // Дата: понеділок, 29.06.2026. ЗАМІНИ час (год, хв, сек) на свій поточний!
+    // ПІСЛЯ першої вдалої прошивки ЗАКОМЕНТУЙ цей рядок, інакше час
+    // буде скидатися при кожному перезавантаженні плати.
+    // ds1307_set(12, 0, 0, /*Mon*/2, 29, 6, 26);
+
+    rtc_time_t now;
     while (1) {
-        read_rtc_datetime();
-        vTaskDelay(1000 / portTICK_PERIOD_MS); // Чекаємо 1 секунду
+        if (ds1307_read(&now) == ESP_OK) {
+            display_clock(&now);
+        } else {
+            ESP_LOGE(TAG, "Помилка читання RTC");
+        }
+        vTaskDelay(1000 / portTICK_PERIOD_MS); // Оновлення раз на секунду
     }
 }
